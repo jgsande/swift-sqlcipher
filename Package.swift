@@ -133,6 +133,14 @@ let package = Package(
         ),
         .library(
             name: "SQLCipher",
+            // STATIC on purpose. With the default (automatic) product type, enabling code
+            // coverage on a consumer's test build fails to link with
+            // `Undefined symbol: ___llvm_profile_runtime`: Xcode instruments the WHOLE test
+            // build, including this C target, but the profile runtime is not linked into a
+            // dynamically-built product. Scoping coverage to specific targets does not help —
+            // that filters the REPORT, not the instrumentation. Static linking puts the C
+            // objects in the same image as the runtime, so instrumented builds link.
+            type: .static,
             targets: ["SQLCipher"]
         )
     ],
