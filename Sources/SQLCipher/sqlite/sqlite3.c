@@ -115464,12 +115464,19 @@ int sqlcipher_ltc_setup(sqlcipher_provider *p) {
 #ifdef SQLCIPHER_CRYPTO_OPENSSL
 /* #include "sqliteInt.h" */
 /* #include "sqlcipher.h" */
+#ifdef SQLCIPHER_SWIFT_CRYPTO_BORINGSSL
+/* Android and Linux route SQLCipher through swift-crypto's BoringSSL, for hardware AES. This header
+   declares the functions below under the CCryptoBoringSSL_ names that swift-crypto's `Crypto`
+   product links into the binary, and defines OPENSSL_IS_BORINGSSL, so no library is linked here. */
+#include "sqlcipher_boringssl.h" /* amalgamator: dontcache */
+#else
 #include <openssl/crypto.h> /* amalgamator: dontcache */
 #include <openssl/rand.h> /* amalgamator: dontcache */
 #include <openssl/evp.h> /* amalgamator: dontcache */
 #include <openssl/objects.h> /* amalgamator: dontcache */
 #include <openssl/hmac.h> /* amalgamator: dontcache */
 #include <openssl/err.h> /* amalgamator: dontcache */
+#endif
 
 /*
  * This is a reference implementation of the sqlcipher_provider interface
@@ -115603,6 +115610,72 @@ static int sqlcipher_openssl_hmac(
 ) {
   int rc = 0;
 
+#if defined(OPENSSL_IS_BORINGSSL) || (defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER < 0x30000000L)
+  /* BoringSSL (incl. swift-crypto's CCryptoBoringSSL, used on Android and Linux for hardware AES)
+     and OpenSSL < 3.0 do not provide the EVP_MAC API. Use the legacy HMAC_CTX_*
+     interface instead. The primitive is identical (HMAC-SHA{1,256,512}), so the digest bytes are
+     byte-for-byte identical to the EVP_MAC path and to the CommonCrypto / LibTomCrypt providers —
+     existing encrypted databases stay readable across providers. */
+  unsigned int outlen = 0;
+  const EVP_MD *evp_digest = NULL;
+  HMAC_CTX *hctx = NULL;
+
+  if(in == NULL) goto error;
+
+  switch(algorithm) {
+    case SQLCIPHER_HMAC_SHA1:   evp_digest = EVP_sha1();   break;
+    case SQLCIPHER_HMAC_SHA256: evp_digest = EVP_sha256(); break;
+    case SQLCIPHER_HMAC_SHA512: evp_digest = EVP_sha512(); break;
+    default:
+      sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: invalid algorithm %d", algorithm);
+      goto error;
+  }
+
+  hctx = HMAC_CTX_new();
+  if(hctx == NULL) {
+    sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: HMAC_CTX_new() failed");
+    sqlcipher_openssl_log_errors();
+    goto error;
+  }
+
+  if(!(rc = HMAC_Init_ex(hctx, hmac_key, key_sz, evp_digest, NULL))) {
+    sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: HMAC_Init_ex() with key size %d and algorithm %d returned %d", key_sz, algorithm, rc);
+    sqlcipher_openssl_log_errors();
+    goto error;
+  }
+
+  if(!(rc = HMAC_Update(hctx, in, in_sz))) {
+    sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: HMAC_Update() on 1st input buffer of %d bytes using algorithm %d returned %d", in_sz, algorithm, rc);
+    sqlcipher_openssl_log_errors();
+    goto error;
+  }
+
+  if(in2 != NULL) {
+    if(!(rc = HMAC_Update(hctx, in2, in2_sz))) {
+      sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: HMAC_Update() on 2nd input buffer of %d bytes using algorithm %d returned %d", in2_sz, algorithm, rc);
+      sqlcipher_openssl_log_errors();
+      goto error;
+    }
+  }
+
+  if(!(rc = HMAC_Final(hctx, out, &outlen))) {
+    sqlcipher_log(SQLCIPHER_LOG_ERROR, SQLCIPHER_LOG_PROVIDER, "sqlcipher_openssl_hmac: HMAC_Final() using algorithm %d returned %d", algorithm, rc);
+    sqlcipher_openssl_log_errors();
+    goto error;
+  }
+
+  rc = SQLITE_OK;
+  goto cleanup;
+
+error:
+  rc = SQLITE_ERROR;
+
+cleanup:
+  if(hctx) HMAC_CTX_free(hctx);
+
+  return rc;
+
+#else
   size_t outlen;
   EVP_MAC *mac = NULL;
   EVP_MAC_CTX *hctx = NULL;
@@ -115690,6 +115763,7 @@ cleanup:
   if(mac) EVP_MAC_free(mac);
 
   return rc;
+#endif
 }
 
 static int sqlcipher_openssl_kdf(

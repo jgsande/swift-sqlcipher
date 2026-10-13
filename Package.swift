@@ -97,11 +97,51 @@ let features: [CSetting] = [
     .define("SQLITE_ENABLE_STAT4", .when(traits: ["ENABLE_STAT4"])),
 ]
 
+// Apple → CommonCrypto. Android and Linux → BoringSSL (swift-crypto's CCryptoBoringSSL). Both give
+// hardware AES. No platform selects LibTomCrypt, and the SQLCipher target does not compile it.
+let appleCryptoPlatforms: [Platform] = [.iOS, .macOS, .macCatalyst, .tvOS, .watchOS, .visionOS]
+let boringsslCryptoPlatforms: [Platform] = [.android, .linux]
+
 let sqlcipherConfiguration: [CSetting] = [
-    .headerSearchPath("libtomcrypt/headers"),
+    // Android and Linux route SQLCipher through swift-crypto's BoringSSL (CCryptoBoringSSL) for
+    // hardware AES. `boringssl/sqlcipher_boringssl.h` declares the 27 functions the OpenSSL provider
+    // calls, under CCryptoBoringSSL's prefixed names, from swift-crypto 4.5.2: check them again when
+    // swift-crypto's `Sources/CCryptoBoringSSL/hash.txt` names a new BoringSSL revision. This package
+    // does not link BoringSSL itself: the code comes from the consumer's link of swift-crypto's
+    // `Crypto` product, which carries CCryptoBoringSSL on Android and Linux. A consumer that does not
+    // link `Crypto` fails to link on those platforms.
+    .headerSearchPath("boringssl", .when(platforms: boringsslCryptoPlatforms)),
+    .define("SQLCIPHER_SWIFT_CRYPTO_BORINGSSL", .when(platforms: boringsslCryptoPlatforms)),
     .define("SQLITE_HAS_CODEC"),
-    .define("SQLCIPHER_CRYPTO_LIBTOMCRYPT"),
-    .define("SQLCIPHER_CRYPTO_CUSTOM", to: "sqlcipher_ltc_setup"),
+    // NDEBUG in EVERY configuration (upstream's `compileTimeOptions` defines it in release only).
+    // The CommonCrypto provider below makes `sqlite3.c` include `<CoreFoundation/CoreFoundation.h>`,
+    // and CoreFoundation includes `<assert.h>`. Under clang modules, which every Apple build uses,
+    // the `assert()`s after that include are active again, although SQLite's own guard
+    // (`#if !defined(NDEBUG) && !defined(SQLITE_DEBUG) → #define NDEBUG`) ran earlier. They reference
+    // `SQLITE_DEBUG`-only symbols (`EdupBuf.zEnd`, `sqlite3KeyInfoIsWriteable`, …), so a Debug build
+    // fails to compile. Without modules, or with LibTomCrypt, it compiles. SQLite runs with asserts
+    // off unless `SQLITE_DEBUG` is set, and this package never sets it.
+    .define("NDEBUG", to: "1"),
+    // Crypto provider is selected PER PLATFORM.
+    //
+    // Apple → CommonCrypto (`SQLCIPHER_CRYPTO_CC`): AES-256-CBC + HMAC-SHA run on the ARMv8
+    // crypto-extension instructions, hardware-accelerated on every A7+ device and on Apple
+    // Silicon. LibTomCrypt's only accelerated AES is x86-only (`aesni.c`, gated on
+    // `LTC_AES_NI && LTC_AMD64_SSE4_1`), so on ARM it falls back to the pure-software
+    // table-based rijndael.
+    //
+    // Android and Linux → BoringSSL via swift-crypto's CCryptoBoringSSL (`SQLCIPHER_CRYPTO_OPENSSL`).
+    // BoringSSL runs AES on the CPU's AES instructions when the CPU has them (ARMv8 crypto
+    // extensions, `aesv8-armv8`, or AES-NI on x86-64), where LibTomCrypt falls back to software
+    // rijndael on ARM. No platform selects
+    // LibTomCrypt, so the SQLCipher target excludes it from the build (`exclude` below).
+    //
+    // The on-disk SQLCipher page format is provider-independent, so a database stays readable
+    // across providers as long as the cipher parameters (page size, HMAC algorithm, KDF) match.
+    .define("SQLCIPHER_CRYPTO_CC", .when(platforms: appleCryptoPlatforms)),
+    .define("SQLCIPHER_CRYPTO_OPENSSL", .when(platforms: boringsslCryptoPlatforms)),
+    // Required for BOTH providers — the amalgamation `#error`s without them. `sqlcipher_extra_init`
+    // is the provider-agnostic registrar that wires up whichever backend was compiled in.
     .define("SQLITE_EXTRA_INIT", to: "sqlcipher_extra_init"),
     .define("SQLITE_EXTRA_SHUTDOWN", to: "sqlcipher_extra_shutdown"),
     .define("SQLITE_ENABLE_API_ARMOR"),
@@ -325,10 +365,20 @@ let package = Package(
     targets: [
         .target(
             name: "SQLCipher",
-            sources: ["sqlite", "libtomcrypt"],
+            // LibTomCrypt is no platform's provider here, so its 491 files are not compiled. They
+            // stay in the tree, as upstream ships them, so a sync with upstream cannot conflict on them.
+            exclude: ["libtomcrypt"],
+            sources: ["sqlite"],
             publicHeadersPath: "sqlite",
             cSettings: compileTimeOptions + platformConfiguration + features + sqlcipherConfiguration,
-            linkerSettings: [.linkedLibrary("log", .when(platforms: [.android]))]),
+            linkerSettings: [
+                .linkedLibrary("log", .when(platforms: [.android])),
+                // The CommonCrypto provider (`crypto_cc.c`) pulls `SecRandomCopyBytes` from
+                // Security and `CFBundleGetBundleWithIdentifier`/`CFSTR` from CoreFoundation.
+                // CommonCrypto itself is in libSystem and needs no explicit link.
+                .linkedFramework("Security", .when(platforms: appleCryptoPlatforms)),
+                .linkedFramework("CoreFoundation", .when(platforms: appleCryptoPlatforms)),
+            ]),
         .testTarget(
             name: "SQLCipherTests",
             dependencies: ["SQLCipher"],
